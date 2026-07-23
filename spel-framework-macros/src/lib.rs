@@ -168,6 +168,8 @@ struct InstructionInfo {
     has_context: bool,
     /// The original function item (with #[instruction] stripped)
     func: ItemFn,
+    /// Optional explicit wire discriminant for an external instruction enum.
+    variant_index: Option<u32>,
 }
 
 struct AccountParam {
@@ -208,6 +210,15 @@ struct ArgParam {
 }
 
 fn expand_lez_program(input: ItemMod, config: ProgramConfig) -> syn::Result<TokenStream2> {
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR").map(std::path::PathBuf::from);
+    expand_lez_program_with_manifest_dir(input, config, manifest_dir.as_deref())
+}
+
+fn expand_lez_program_with_manifest_dir(
+    input: ItemMod,
+    config: ProgramConfig,
+    manifest_dir: Option<&std::path::Path>,
+) -> syn::Result<TokenStream2> {
     let mod_name = &input.ident;
 
     let (_, items) = input
@@ -352,13 +363,12 @@ fn expand_lez_program(input: ItemMod, config: ProgramConfig) -> syn::Result<Toke
     // Collect #[account_type] annotated types from the source file's top-level items.
     // Expands the candidate set to cover common Rust module/bin layouts and verifies
     // that the candidate file actually defines the target module, avoiding false matches.
-    let (accounts, types) = {
+    let (accounts, types, program_source_path) = {
         let module_path = mod_name.to_string();
         let mut result = (Vec::new(), Vec::new());
+        let mut source_path = None;
 
-        if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
-            let manifest = std::path::Path::new(&manifest_dir);
-
+        if let Some(manifest) = manifest_dir {
             // Check if a parsed file defines the target module
             let file_matches_module = |parsed_file: &syn::File| {
                 parsed_file.items.iter().any(
@@ -431,19 +441,66 @@ fn expand_lez_program(input: ItemMod, config: ProgramConfig) -> syn::Result<Toke
                                 }
                             }
                             result = account_types::collect_account_types(&all_items);
+                            source_path = Some(guest_path.clone());
                             break;
                         }
                     }
                 }
             }
         }
-        result
+        (result.0, result.1, source_path)
     };
+
+    let instruction_names: Vec<String> = instructions
+        .iter()
+        .map(|instruction| instruction.fn_name.to_string())
+        .collect();
+    let explicit_variant_indices: Vec<Option<u32>> = instructions
+        .iter()
+        .map(|instruction| instruction.variant_index)
+        .collect();
+    if ext_instr_str.is_none() && explicit_variant_indices.iter().any(Option::is_some) {
+        return Err(syn::Error::new_spanned(
+            &input.ident,
+            "#[instruction(variant_index = N)] requires #[lez_program(instruction = \"crate::Enum\")]",
+        ));
+    }
+    let external_variant_indices = ext_instr_str
+        .as_deref()
+        .map(|instruction_type| {
+            spel_framework_core::idl_gen::resolve_external_instruction_variant_indices(
+                instruction_type,
+                &instruction_names,
+                &explicit_variant_indices,
+                program_source_path.as_deref(),
+            )
+            .map_err(|message| syn::Error::new_spanned(&input.ident, message))
+        })
+        .transpose()?;
+
+    let dependency_tracking: Vec<TokenStream2> = program_source_path
+        .as_deref()
+        .map(|source_path| {
+            let dependency_dirs =
+                spel_framework_core::idl_gen::find_path_dep_dirs(source_path, |_| {});
+            let (_, source_files) =
+                spel_framework_core::idl_gen::collect_items_from_crate_dirs(&dependency_dirs);
+            source_files
+                .iter()
+                .filter_map(|path| path.to_str())
+                .map(|path| {
+                    let literal = syn::LitStr::new(path, proc_macro2::Span::call_site());
+                    quote! { const _: &str = include_str!(#literal); }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     let idl_fn = generate_idl_fn(
         mod_name,
         &instructions,
         ext_instr_str.as_deref(),
+        external_variant_indices.as_deref(),
         accounts.clone(),
         types.clone(),
     );
@@ -451,12 +508,15 @@ fn expand_lez_program(input: ItemMod, config: ProgramConfig) -> syn::Result<Toke
         mod_name,
         &instructions,
         ext_instr_str.as_deref(),
+        external_variant_indices.as_deref(),
         accounts,
         types,
     );
 
     // Assemble everything
     let expanded = quote! {
+        #(#dependency_tracking)*
+
         // The instruction enum (used by both on-chain and client)
         #enum_def
 
@@ -494,6 +554,7 @@ fn has_instruction_attr(attrs: &[Attribute]) -> bool {
 
 fn parse_instruction(func: ItemFn) -> syn::Result<InstructionInfo> {
     let fn_name = func.sig.ident.clone();
+    let variant_index = parse_instruction_variant_index(&func.attrs)?;
     let mut accounts = Vec::new();
     let mut args = Vec::new();
     let mut has_context = false;
@@ -555,7 +616,35 @@ fn parse_instruction(func: ItemFn) -> syn::Result<InstructionInfo> {
         args,
         has_context,
         func,
+        variant_index,
     })
+}
+
+fn parse_instruction_variant_index(attrs: &[Attribute]) -> syn::Result<Option<u32>> {
+    let mut variant_index = None;
+
+    for attr in attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("instruction"))
+    {
+        if matches!(attr.meta, syn::Meta::Path(_)) {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if !meta.path.is_ident("variant_index") {
+                return Err(meta.error("unknown instruction attribute"));
+            }
+            if variant_index.is_some() {
+                return Err(meta.error("duplicate instruction variant_index"));
+            }
+
+            let value = meta.value()?;
+            variant_index = Some(value.parse::<syn::LitInt>()?.base10_parse::<u32>()?);
+            Ok(())
+        })?;
+    }
+
+    Ok(variant_index)
 }
 
 fn extract_param_name(pat_type: &PatType) -> syn::Result<Ident> {
@@ -1720,6 +1809,7 @@ fn generate_idl_fn(
     mod_name: &Ident,
     instructions: &[InstructionInfo],
     external_instruction: Option<&str>,
+    external_variant_indices: Option<&[u32]>,
     accounts: Vec<spel_framework_core::idl::IdlAccountType>,
     types: Vec<spel_framework_core::idl::IdlTypeDef>,
 ) -> TokenStream2 {
@@ -1735,7 +1825,8 @@ fn generate_idl_fn(
 
     let instruction_literals: Vec<TokenStream2> = instructions
         .iter()
-        .map(|ix| {
+        .enumerate()
+        .map(|(position, ix)| {
             let ix_name = ix.fn_name.to_string();
 
             let account_literals: Vec<TokenStream2> = ix
@@ -1849,12 +1940,19 @@ fn generate_idl_fn(
                     })
                     .collect::<String>()
             };
+            let variant_index = match external_variant_indices
+                .and_then(|indices| indices.get(position))
+            {
+                Some(index) => quote! { Some(#index) },
+                None => quote! { None },
+            };
 
             quote! {
                 spel_framework::idl::IdlInstruction {
                     name: #ix_name.to_string(),
                     accounts: vec![#(#account_literals),*],
                     args: vec![#(#arg_literals),*],
+                    variant_index: #variant_index,
                     discriminator: Some(vec![#(#disc_bytes_lit),*]),
                     execution: Some(spel_framework::idl::IdlExecution {
                         public: true,
@@ -1902,6 +2000,7 @@ fn generate_idl_json(
     mod_name: &Ident,
     instructions: &[InstructionInfo],
     external_instruction: Option<&str>,
+    external_variant_indices: Option<&[u32]>,
     accounts: Vec<spel_framework_core::idl::IdlAccountType>,
     types: Vec<spel_framework_core::idl::IdlTypeDef>,
 ) -> String {
@@ -1917,7 +2016,8 @@ fn generate_idl_json(
 
     let instructions_json: Vec<String> = instructions
         .iter()
-        .map(|ix| {
+        .enumerate()
+        .map(|(position, ix)| {
             let ix_name = &ix.fn_name.to_string();
 
             let accounts_json: Vec<String> = ix
@@ -1983,9 +2083,13 @@ fn generate_idl_json(
                     format!("{{\"name\":\"{name}\",\"type\":{type_json}}}")
                 })
                 .collect();
+            let variant_index_json = external_variant_indices
+                .and_then(|indices| indices.get(position))
+                .map(|index| format!(",\"variant_index\":{index}"))
+                .unwrap_or_default();
 
             format!(
-                "{{\"name\":\"{}\",\"accounts\":[{}],\"args\":[{}]}}",
+                "{{\"name\":\"{}\",\"accounts\":[{}],\"args\":[{}]{variant_index_json}}}",
                 ix_name,
                 accounts_json.join(","),
                 args_json.join(",")
@@ -2097,6 +2201,34 @@ fn expand_generate_idl(file_path: &str, span_token: &syn::LitStr) -> syn::Result
             ext
         });
 
+    let resolved_path_buf = std::path::Path::new(&resolved_path).to_path_buf();
+    let instruction_names: Vec<String> = instructions
+        .iter()
+        .map(|instruction| instruction.fn_name.to_string())
+        .collect();
+    let explicit_variant_indices: Vec<Option<u32>> = instructions
+        .iter()
+        .map(|instruction| instruction.variant_index)
+        .collect();
+    if external_instruction_str.is_none() && explicit_variant_indices.iter().any(Option::is_some) {
+        return Err(syn::Error::new_spanned(
+            span_token,
+            "#[instruction(variant_index = N)] requires #[lez_program(instruction = \"crate::Enum\")]",
+        ));
+    }
+    let external_variant_indices = external_instruction_str
+        .as_deref()
+        .map(|instruction_type| {
+            spel_framework_core::idl_gen::resolve_external_instruction_variant_indices(
+                instruction_type,
+                &instruction_names,
+                &explicit_variant_indices,
+                Some(&resolved_path_buf),
+            )
+            .map_err(|message| syn::Error::new_spanned(span_token, message))
+        })
+        .transpose()?;
+
     // Collect #[account_type] annotated types: search both the file's top-level
     // items and the items inside the #[lez_program] module body, since user code
     // commonly defines account structs inside the program module.
@@ -2107,7 +2239,6 @@ fn expand_generate_idl(file_path: &str, span_token: &syn::LitStr) -> syn::Result
     // This handles the common project structure where account types are defined
     // in a shared core crate (e.g. my_program_core) and the program binary
     // depends on it via `path = "..."`.
-    let resolved_path_buf = std::path::Path::new(&resolved_path).to_path_buf();
     let dep_dirs = spel_framework_core::idl_gen::find_path_dep_dirs(&resolved_path_buf, |_| {});
     let (extra_items, dep_source_files) =
         spel_framework_core::idl_gen::collect_items_from_crate_dirs(&dep_dirs);
@@ -2120,6 +2251,7 @@ fn expand_generate_idl(file_path: &str, span_token: &syn::LitStr) -> syn::Result
         mod_name,
         &instructions,
         external_instruction_str.as_deref(),
+        external_variant_indices.as_deref(),
         accounts,
         types,
     );
@@ -2168,10 +2300,6 @@ mod tests {
             let path = std::env::temp_dir().join(format!("spel-macro-test-{label}-{n}"));
             std::fs::create_dir_all(&path).unwrap();
             TempDir(path)
-        }
-
-        fn path(&self) -> &std::path::Path {
-            &self.0
         }
 
         fn write(&self, rel: &str, content: &str) -> std::path::PathBuf {
@@ -2471,6 +2599,171 @@ pub mod token {
         assert!(
             output.contains("VaultConfig"),
             "VaultConfig with qualified attribute not found in generated IDL. Output: {output}"
+        );
+    }
+
+    #[test]
+    fn generate_idl_maps_external_enum_order_from_path_dependency() {
+        let tmp = TempDir::new("generate-idl-external-enum-order");
+        tmp.write(
+            "core/Cargo.toml",
+            "[package]\nname = \"token_core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        tmp.write(
+            "core/src/lib.rs",
+            r#"
+#[derive(Serialize, Deserialize)]
+pub enum Instruction {
+    Transfer,
+    PrintNft,
+    SetAuthority,
+}
+"#,
+        );
+        tmp.write(
+            "methods/guest/Cargo.toml",
+            "[package]\nname = \"token-guest\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\ntoken_core = { path = \"../../core\" }\n",
+        );
+        let program = tmp.write(
+            "methods/guest/src/bin/token.rs",
+            r#"
+#[lez_program(instruction = "token_core::Instruction")]
+pub mod token {
+    #[instruction]
+    pub fn transfer() {}
+
+    #[instruction]
+    pub fn set_authority() {}
+
+    #[instruction]
+    pub fn print_nft() {}
+}
+"#,
+        );
+
+        let tokens = expand_generate_idl(
+            program.to_str().unwrap(),
+            &syn::LitStr::new("test", proc_macro2::Span::call_site()),
+        )
+        .expect("IDL macro expansion succeeds");
+        let output = tokens.to_string();
+
+        for expected in [
+            "variant_index\\\":0",
+            "variant_index\\\":2",
+            "variant_index\\\":1",
+        ] {
+            assert!(
+                output.contains(expected),
+                "generated external IDL misses `{expected}`: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn lez_program_maps_external_enum_order_from_path_dependency_in_both_idls() {
+        let tmp = TempDir::new("lez-program-external-enum-order");
+        tmp.write(
+            "core/Cargo.toml",
+            "[package]\nname = \"token_core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        tmp.write(
+            "core/src/lib.rs",
+            r#"
+#[derive(Serialize, Deserialize)]
+pub enum Instruction {
+    Transfer,
+    PrintNft,
+    SetAuthority,
+}
+"#,
+        );
+        let manifest = tmp.write(
+            "methods/guest/Cargo.toml",
+            "[package]\nname = \"token-guest\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\ntoken_core = { path = \"../../core\" }\n",
+        );
+        let source = r#"
+#[lez_program(instruction = "token_core::Instruction")]
+mod token {
+    #[instruction]
+    fn transfer() {}
+
+    #[instruction]
+    fn set_authority() {}
+
+    #[instruction]
+    fn print_nft() {}
+}
+"#;
+        tmp.write("methods/guest/src/bin/token.rs", source);
+
+        let input: ItemMod = syn::parse_str(source).expect("program module parses");
+        let config = ProgramConfig {
+            external_instruction: Some(
+                syn::parse_str("token_core::Instruction").expect("instruction path parses"),
+            ),
+        };
+        let output = expand_lez_program_with_manifest_dir(input, config, manifest.parent())
+            .expect("program expansion succeeds")
+            .to_string();
+
+        for expected in [
+            "variant_index : Some (0u32)",
+            "variant_index : Some (2u32)",
+            "variant_index : Some (1u32)",
+            "variant_index\\\":0",
+            "variant_index\\\":2",
+            "variant_index\\\":1",
+        ] {
+            assert!(
+                output.contains(expected),
+                "generated program IDL misses `{expected}`: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn lez_program_emits_explicit_external_variant_indices_in_both_idls() {
+        let input: ItemMod = syn::parse_str(
+            r#"
+                #[lez_program(instruction = "token_core::Instruction")]
+                mod token {
+                    #[instruction(variant_index = 8)]
+                    fn set_authority() {}
+
+                    #[instruction(variant_index = 7)]
+                    fn print_nft() {}
+                }
+            "#,
+        )
+        .expect("program module parses");
+        let config = ProgramConfig {
+            external_instruction: Some(
+                syn::parse_str("token_core::Instruction").expect("instruction path parses"),
+            ),
+        };
+
+        let output = expand_lez_program(input, config)
+            .expect("program expansion succeeds")
+            .to_string();
+
+        assert!(
+            output.contains("variant_index : Some (8u32)"),
+            "runtime IDL misses set_authority discriminant: {output}"
+        );
+        assert!(
+            output.contains("variant_index : Some (7u32)"),
+            "runtime IDL misses print_nft discriminant: {output}"
+        );
+        assert!(
+            output.contains("variant_index\\\":8"),
+            "JSON IDL misses set_authority discriminant: {output}"
+        );
+        assert!(
+            output.contains("variant_index\\\":7"),
+            "JSON IDL misses print_nft discriminant: {output}"
         );
     }
 }

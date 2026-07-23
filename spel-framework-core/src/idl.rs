@@ -8,8 +8,9 @@
 //!
 //! This IDL format is a superset of the lssa-lang IDL spec. Fields like
 //! `discriminator`, `execution`, and `visibility` are included for
-//! compatibility with lssa-lang tooling. All new fields are optional
-//! and backward-compatible with existing SPEL programs.
+//! compatibility with lssa-lang tooling. New serialized fields are optional,
+//! so existing IDL JSON remains readable. Rust callers that construct these
+//! public structs directly must follow the migration notes in the changelog.
 
 use serde::{Deserialize, Serialize};
 
@@ -62,6 +63,12 @@ pub struct IdlInstruction {
     pub name: String,
     pub accounts: Vec<IdlAccountItem>,
     pub args: Vec<IdlArg>,
+    /// Wire discriminant for an instruction declared by an external enum.
+    ///
+    /// This is required when [`SpelIdl::instruction_type`] is set. It remains
+    /// optional so legacy positional IDLs stay readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant_index: Option<u32>,
     /// SHA256("global:{name}")[..8] discriminator (lssa-lang compat).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discriminator: Option<Vec<u8>>,
@@ -221,5 +228,48 @@ impl SpelIdl {
     /// Serialize the IDL to pretty-printed JSON.
     pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IdlInstruction, SpelIdl};
+
+    #[test]
+    fn legacy_instruction_without_variant_index_remains_readable() {
+        let parsed = serde_json::from_str::<SpelIdl>(
+            r#"{
+                "version": "0.1.0",
+                "name": "legacy",
+                "instructions": [{"name": "transfer", "accounts": [], "args": []}]
+            }"#,
+        );
+
+        assert!(matches!(
+            parsed,
+            Ok(idl) if idl.instructions[0].variant_index.is_none()
+        ));
+    }
+
+    #[test]
+    fn explicit_variant_index_round_trips() {
+        let mut idl = SpelIdl::new("external");
+        idl.instructions.push(IdlInstruction {
+            name: "set_authority".to_string(),
+            accounts: vec![],
+            args: vec![],
+            variant_index: Some(8),
+            discriminator: None,
+            execution: None,
+            variant: None,
+        });
+
+        let decoded = serde_json::to_string(&idl)
+            .and_then(|encoded| serde_json::from_str::<SpelIdl>(&encoded));
+
+        assert!(matches!(
+            decoded,
+            Ok(idl) if idl.instructions[0].variant_index == Some(8)
+        ));
     }
 }

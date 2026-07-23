@@ -7,11 +7,11 @@
 //! `spel-framework-macros`, but operates at runtime on a file path
 //! rather than at compile time.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use syn::{Attribute, FnArg, Ident, ItemFn, Pat, PatType, Type};
+use syn::{Attribute, FnArg, Ident, ItemEnum, ItemFn, Pat, PatType, Type};
 
 use crate::idl::{IdlAccountItem, IdlArg, IdlInstruction, IdlPda, IdlSeed, SpelIdl};
 
@@ -24,6 +24,7 @@ pub enum IdlGenError {
     Parse(syn::Error),
     NoProgram(String),
     NoInstructions(String),
+    ExternalInstructionMapping(String),
 }
 
 impl fmt::Display for IdlGenError {
@@ -37,6 +38,7 @@ impl fmt::Display for IdlGenError {
             IdlGenError::NoInstructions(path) => {
                 write!(f, "No #[instruction] functions found in '{path}'")
             },
+            IdlGenError::ExternalInstructionMapping(message) => f.write_str(message),
         }
     }
 }
@@ -57,6 +59,12 @@ impl From<syn::Error> for IdlGenError {
 ///
 /// The path is resolved relative to the current working directory,
 /// which is the natural behavior for a CLI tool.
+///
+/// # Errors
+///
+/// Returns an error when the source cannot be read or parsed, when it does not
+/// contain a valid program module, or when its external instruction mapping
+/// cannot be proven.
 pub fn generate_idl_from_file(source_path: &Path) -> Result<SpelIdl, IdlGenError> {
     generate_idl_from_file_with_deps(source_path, &[])
 }
@@ -69,13 +77,24 @@ pub fn generate_idl_from_file(source_path: &Path) -> Result<SpelIdl, IdlGenError
 /// that contains `src/lib.rs`).  Only local path-dependencies should be passed
 /// here — third-party registry or git crates are intentionally excluded to
 /// avoid pulling in unrelated type definitions.
+///
+/// # Errors
+///
+/// Returns an error when the source cannot be read or parsed, when it does not
+/// contain a valid program module, or when its external instruction mapping
+/// cannot be proven.
 pub fn generate_idl_from_file_with_deps(
     source_path: &Path,
     dep_source_dirs: &[PathBuf],
 ) -> Result<SpelIdl, IdlGenError> {
     let content = std::fs::read_to_string(source_path)?;
     let (extra_items, _) = collect_items_from_crate_dirs(dep_source_dirs);
-    generate_idl_inner(&content, &source_path.display().to_string(), &extra_items)
+    generate_idl_inner(
+        &content,
+        &source_path.display().to_string(),
+        Some(source_path),
+        &extra_items,
+    )
 }
 
 /// Parse a SPEL program from source text and return its [`SpelIdl`].
@@ -84,7 +103,7 @@ pub fn generate_idl_from_file_with_deps(
 /// production code goes through `generate_idl_from_file_with_deps`.
 #[cfg(test)]
 fn generate_idl_from_str(content: &str, source_label: &str) -> Result<SpelIdl, IdlGenError> {
-    generate_idl_inner(content, source_label, &[])
+    generate_idl_inner(content, source_label, None, &[])
 }
 
 /// Core IDL generation logic. `extra_items` are synthetic items collected from
@@ -93,6 +112,7 @@ fn generate_idl_from_str(content: &str, source_label: &str) -> Result<SpelIdl, I
 fn generate_idl_inner(
     content: &str,
     source_label: &str,
+    source_path: Option<&Path>,
     extra_items: &[syn::Item],
 ) -> Result<SpelIdl, IdlGenError> {
     let path_str = source_label.to_string();
@@ -154,10 +174,38 @@ fn generate_idl_inner(
             ext
         });
 
+    let instruction_names: Vec<String> = instructions
+        .iter()
+        .map(|instruction| instruction.fn_name.to_string())
+        .collect();
+    let explicit_variant_indices: Vec<Option<u32>> = instructions
+        .iter()
+        .map(|instruction| instruction.variant_index)
+        .collect();
+    if external_instruction.is_none() && explicit_variant_indices.iter().any(Option::is_some) {
+        return Err(IdlGenError::ExternalInstructionMapping(
+            "#[instruction(variant_index = N)] requires #[lez_program(instruction = \"crate::Enum\")]"
+                .to_string(),
+        ));
+    }
+    let external_variant_indices = external_instruction
+        .as_deref()
+        .map(|instruction_type| {
+            resolve_external_instruction_variant_indices(
+                instruction_type,
+                &instruction_names,
+                &explicit_variant_indices,
+                source_path,
+            )
+            .map_err(IdlGenError::ExternalInstructionMapping)
+        })
+        .transpose()?;
+
     // Build the SpelIdl struct
     let idl_instructions: Vec<IdlInstruction> = instructions
         .iter()
-        .map(|ix| {
+        .enumerate()
+        .map(|(index, ix)| {
             let accounts: Vec<IdlAccountItem> = ix
                 .accounts
                 .iter()
@@ -207,6 +255,9 @@ fn generate_idl_inner(
                 name: ix.fn_name.to_string(),
                 accounts,
                 args,
+                variant_index: external_variant_indices
+                    .as_ref()
+                    .and_then(|indices| indices.get(index).copied()),
                 discriminator: None,
                 execution: None,
                 variant: None,
@@ -230,6 +281,282 @@ fn generate_idl_inner(
         metadata: None,
         instruction_type: external_instruction,
     })
+}
+
+/// Resolve wire discriminants for handlers backed by an external instruction
+/// enum.
+///
+/// When every handler declares `#[instruction(variant_index = N)]`, those
+/// values are validated and used directly. Otherwise, this reads the external
+/// enum from a direct local path dependency of `source_path`, maps enum
+/// declaration order to handler names, and requires a complete mapping.
+///
+/// Registry, git, re-exported, and custom-codec enums cannot be proven from
+/// local source. They must use explicit `variant_index` metadata on every
+/// handler rather than silently falling back to handler position.
+///
+/// # Errors
+///
+/// Returns an error if the map is incomplete or ambiguous, if explicit metadata
+/// is partial or duplicated, or if the local enum source cannot prove a plain
+/// one-to-one declaration-order mapping.
+pub fn resolve_external_instruction_variant_indices(
+    instruction_type: &str,
+    instruction_names: &[String],
+    explicit_variant_indices: &[Option<u32>],
+    source_path: Option<&Path>,
+) -> Result<Vec<u32>, String> {
+    if instruction_names.len() != explicit_variant_indices.len() {
+        return Err(format!(
+            "external instruction_type `{instruction_type}` has {} instruction names but {} variant indices",
+            instruction_names.len(),
+            explicit_variant_indices.len()
+        ));
+    }
+
+    let explicit_count = explicit_variant_indices
+        .iter()
+        .filter(|index| index.is_some())
+        .count();
+    if explicit_count == instruction_names.len() {
+        let indices = explicit_variant_indices
+            .iter()
+            .copied()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                format!(
+                    "external instruction_type `{instruction_type}` has an incomplete variant_index map"
+                )
+            })?;
+        validate_explicit_instruction_variant_indices(
+            instruction_type,
+            instruction_names,
+            &indices,
+        )?;
+        return Ok(indices);
+    }
+    if explicit_count != 0 {
+        return Err(format!(
+            "external instruction_type `{instruction_type}` must declare #[instruction(variant_index = N)] on every handler or on none of them"
+        ));
+    }
+
+    let source_path = source_path.ok_or_else(|| {
+        format!(
+            "external instruction_type `{instruction_type}` has no source path for enum mapping; declare #[instruction(variant_index = N)] on every handler"
+        )
+    })?;
+    let (crate_name, enum_name) = external_instruction_type_parts(instruction_type)?;
+    let dependencies = find_direct_path_dependencies(source_path, |_| {});
+    let dependency_dir = dependencies
+        .get(crate_name)
+        .or_else(|| {
+            let normalized_crate_name = normalize_crate_name(crate_name);
+            dependencies.iter().find_map(|(name, path)| {
+                (normalize_crate_name(name) == normalized_crate_name).then_some(path)
+            })
+        })
+        .ok_or_else(|| {
+            format!(
+                "external instruction_type `{instruction_type}` does not resolve to a direct local path dependency named `{crate_name}`; declare #[instruction(variant_index = N)] on every handler"
+            )
+        })?;
+    let enum_variants = instruction_variant_indices_from_crate_dir(dependency_dir, enum_name)?;
+    map_instruction_names_to_enum_indices(instruction_type, instruction_names, &enum_variants)
+}
+
+fn validate_explicit_instruction_variant_indices(
+    instruction_type: &str,
+    instruction_names: &[String],
+    indices: &[u32],
+) -> Result<(), String> {
+    let mut names = HashSet::with_capacity(instruction_names.len());
+    let mut variant_indices = HashSet::with_capacity(indices.len());
+
+    for (name, index) in instruction_names.iter().zip(indices) {
+        if !names.insert(name) {
+            return Err(format!(
+                "external instruction_type `{instruction_type}` has duplicate handler name `{name}`"
+            ));
+        }
+        if !variant_indices.insert(*index) {
+            return Err(format!(
+                "external instruction_type `{instruction_type}` has duplicate variant_index {index}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn external_instruction_type_parts(instruction_type: &str) -> Result<(&str, &str), String> {
+    let segments = instruction_type
+        .split("::")
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    if segments.len() != 2 || segments.iter().any(|segment| segment.is_empty()) {
+        return Err(format!(
+            "external instruction_type `{instruction_type}` must use a direct `crate::Enum` path or declare #[instruction(variant_index = N)] on every handler"
+        ));
+    }
+    let crate_name = segments
+        .first()
+        .copied()
+        .ok_or_else(|| "external instruction type has no crate segment".to_string())?;
+    let enum_name = segments
+        .last()
+        .copied()
+        .ok_or_else(|| "external instruction type has no enum segment".to_string())?;
+    Ok((crate_name, enum_name))
+}
+
+fn normalize_crate_name(name: &str) -> String {
+    name.strip_prefix("r#").unwrap_or(name).replace('-', "_")
+}
+
+fn instruction_variant_indices_from_crate_dir(
+    crate_dir: &Path,
+    enum_name: &str,
+) -> Result<BTreeMap<String, (String, u32)>, String> {
+    let (items, _) = collect_items_from_crate_dirs(&[crate_dir.to_path_buf()]);
+    let instruction_enum = find_named_enum(&items, enum_name)
+        .ok_or_else(|| format!("external instruction enum `{enum_name}` was not found"))?;
+    if instruction_enum.variants.is_empty() {
+        return Err(format!(
+            "external instruction enum `{enum_name}` has no variants"
+        ));
+    }
+    if !is_plain_serde_enum(instruction_enum) {
+        return Err(format!(
+            "external instruction enum `{enum_name}` is not a plain #[derive(Serialize, Deserialize)] enum; declare #[instruction(variant_index = N)] on every handler"
+        ));
+    }
+
+    let mut indices = BTreeMap::new();
+    for (position, variant) in instruction_enum.variants.iter().enumerate() {
+        let index = u32::try_from(position).map_err(|_error| {
+            format!("external instruction enum `{enum_name}` has too many variants")
+        })?;
+        let variant_name = variant.ident.to_string();
+        let normalized_name = normalized_identifier(&variant_name)?;
+        if let Some((previous_name, _)) =
+            indices.insert(normalized_name, (variant_name.clone(), index))
+        {
+            return Err(format!(
+                "external instruction enum `{enum_name}` has ambiguous variants `{previous_name}` and `{variant_name}`"
+            ));
+        }
+    }
+    Ok(indices)
+}
+
+fn is_plain_serde_enum(item_enum: &ItemEnum) -> bool {
+    let derives_serde = ["Serialize", "Deserialize"].into_iter().all(|required| {
+        item_enum.attrs.iter().any(|attr| {
+            attr.path().is_ident("derive")
+                && attr
+                    .parse_args_with(
+                        syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
+                    )
+                    .map(|paths| {
+                        paths.iter().any(|path| {
+                            path.segments
+                                .last()
+                                .is_some_and(|segment| segment.ident == required)
+                        })
+                    })
+                    .unwrap_or(false)
+        })
+    });
+    let has_custom_codec_attribute = item_enum.attrs.iter().any(|attr| {
+        attr.path().is_ident("repr")
+            || attr.path().is_ident("serde")
+            || attr.path().is_ident("borsh")
+    });
+
+    derives_serde
+        && !has_custom_codec_attribute
+        && item_enum
+            .variants
+            .iter()
+            .all(|variant| variant.discriminant.is_none())
+}
+
+fn find_named_enum<'a>(items: &'a [syn::Item], enum_name: &str) -> Option<&'a ItemEnum> {
+    for item in items {
+        if let syn::Item::Enum(item_enum) = item {
+            if item_enum.ident == enum_name {
+                return Some(item_enum);
+            }
+            continue;
+        }
+        if let syn::Item::Mod(item_mod) = item {
+            if let Some((_, nested_items)) = &item_mod.content {
+                if let Some(item_enum) = find_named_enum(nested_items, enum_name) {
+                    return Some(item_enum);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn map_instruction_names_to_enum_indices(
+    instruction_type: &str,
+    instruction_names: &[String],
+    enum_variants: &BTreeMap<String, (String, u32)>,
+) -> Result<Vec<u32>, String> {
+    if instruction_names.len() != enum_variants.len() {
+        return Err(format!(
+            "external instruction_type `{instruction_type}` has {} enum variants but {} handlers; generation must expose a complete mapping",
+            enum_variants.len(),
+            instruction_names.len()
+        ));
+    }
+
+    let mut handler_names = HashSet::with_capacity(instruction_names.len());
+    let mut used_variants = HashSet::with_capacity(enum_variants.len());
+    let mut indices = Vec::with_capacity(instruction_names.len());
+    for instruction_name in instruction_names {
+        if !handler_names.insert(instruction_name) {
+            return Err(format!(
+                "external instruction_type `{instruction_type}` has duplicate handler name `{instruction_name}`"
+            ));
+        }
+        let normalized_name = normalized_identifier(instruction_name)?;
+        let (enum_name, index) = enum_variants.get(&normalized_name).ok_or_else(|| {
+            format!(
+                "handler `{instruction_name}` does not match a variant of external instruction_type `{instruction_type}`"
+            )
+        })?;
+        if !used_variants.insert(normalized_name) {
+            return Err(format!(
+                "multiple handlers map to external enum variant `{enum_name}` of `{instruction_type}`"
+            ));
+        }
+        indices.push(*index);
+    }
+
+    if used_variants.len() != enum_variants.len() {
+        return Err(format!(
+            "external instruction_type `{instruction_type}` did not produce a complete variant map"
+        ));
+    }
+    Ok(indices)
+}
+
+fn normalized_identifier(value: &str) -> Result<String, String> {
+    let value = value.strip_prefix("r#").unwrap_or(value);
+    let normalized = value
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    if normalized.is_empty() {
+        return Err(format!(
+            "identifier `{value}` has no alphanumeric characters"
+        ));
+    }
+    Ok(normalized)
 }
 
 // ─── Dependency source collection ────────────────────────────────────────
@@ -546,6 +873,7 @@ struct InstructionInfo {
     fn_name: Ident,
     accounts: Vec<AccountParam>,
     args: Vec<ArgParam>,
+    variant_index: Option<u32>,
 }
 
 struct AccountParam {
@@ -580,6 +908,7 @@ fn has_instruction_attr(attrs: &[Attribute]) -> bool {
 
 fn parse_instruction(func: ItemFn) -> Result<InstructionInfo, IdlGenError> {
     let fn_name = func.sig.ident.clone();
+    let variant_index = parse_instruction_variant_index(&func.attrs)?;
     let mut accounts = Vec::new();
     let mut args = Vec::new();
 
@@ -625,7 +954,37 @@ fn parse_instruction(func: ItemFn) -> Result<InstructionInfo, IdlGenError> {
         fn_name,
         accounts,
         args,
+        variant_index,
     })
+}
+
+fn parse_instruction_variant_index(attrs: &[Attribute]) -> Result<Option<u32>, IdlGenError> {
+    let mut variant_index = None;
+
+    for attr in attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("instruction"))
+    {
+        if matches!(attr.meta, syn::Meta::Path(_)) {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if !meta.path.is_ident("variant_index") {
+                return Err(meta.error("unknown instruction attribute"));
+            }
+            if variant_index.is_some() {
+                return Err(meta.error("duplicate instruction variant_index"));
+            }
+
+            let value = meta.value()?;
+            let index = value.parse::<syn::LitInt>()?.base10_parse::<u32>()?;
+            variant_index = Some(index);
+            Ok(())
+        })
+        .map_err(IdlGenError::Parse)?;
+    }
+
+    Ok(variant_index)
 }
 
 fn extract_param_name(pat_type: &PatType) -> Result<Ident, IdlGenError> {
@@ -1061,10 +1420,115 @@ fn _find_crate_manifest<F: FnMut(String)>(start: &Path, on_warning: &mut F) -> O
     }
 }
 
+/// Resolve direct local path dependencies for the crate that owns
+/// `source_path`. The key is the dependency alias used in Rust source.
+fn find_direct_path_dependencies<F: FnMut(String)>(
+    source_path: &Path,
+    mut on_warning: F,
+) -> BTreeMap<String, PathBuf> {
+    let manifest = match find_program_manifest(source_path, &mut on_warning) {
+        Some(manifest) => manifest,
+        None => return BTreeMap::new(),
+    };
+    let manifest_dir = match manifest.parent() {
+        Some(directory) => directory,
+        None => return BTreeMap::new(),
+    };
+    let content = match std::fs::read_to_string(&manifest) {
+        Ok(content) => content,
+        Err(error) => {
+            on_warning(format!(
+                "could not read manifest '{}': {error}",
+                manifest.display()
+            ));
+            return BTreeMap::new();
+        },
+    };
+    let value: toml::Value = match toml::from_str(&content) {
+        Ok(value) => value,
+        Err(error) => {
+            on_warning(format!(
+                "failed to parse manifest '{}': {error}",
+                manifest.display()
+            ));
+            return BTreeMap::new();
+        },
+    };
+
+    value
+        .get("dependencies")
+        .and_then(toml::Value::as_table)
+        .into_iter()
+        .flat_map(|dependencies| dependencies.iter())
+        .filter_map(|(name, dependency)| {
+            let relative_path = dependency.get("path").and_then(toml::Value::as_str)?;
+            let dependency_dir = manifest_dir.join(relative_path);
+            if dependency_dir.is_dir() {
+                Some((name.clone(), dependency_dir))
+            } else {
+                on_warning(format!(
+                    "path dependency '{name}' points to non-existent directory: {}",
+                    dependency_dir.display()
+                ));
+                None
+            }
+        })
+        .collect()
+}
+
+/// Return the package manifest that owns `source_path`, resolving a virtual
+/// workspace root to its matching member manifest when necessary.
+fn find_program_manifest<F: FnMut(String)>(
+    source_path: &Path,
+    on_warning: &mut F,
+) -> Option<PathBuf> {
+    let manifest = _find_crate_manifest(source_path, on_warning)?;
+    let content = std::fs::read_to_string(&manifest).ok()?;
+    let value = toml::from_str::<toml::Value>(&content).ok()?;
+    let is_virtual_workspace = value.get("workspace").is_some() && value.get("package").is_none();
+    if !is_virtual_workspace {
+        return Some(manifest);
+    }
+
+    let workspace_root = manifest.parent()?;
+    _find_member_manifest(workspace_root, &value, source_path, on_warning)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::idl::{IdlSeed, IdlType, SpelIdl};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let counter = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "spel-framework-core-idl-gen-{label}-{}-{counter}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).expect("temporary test directory is created");
+            Self(path)
+        }
+
+        fn write(&self, relative_path: &str, content: &str) -> PathBuf {
+            let path = self.0.join(relative_path);
+            let parent = path.parent().expect("test path has parent");
+            std::fs::create_dir_all(parent).expect("temporary test parent is created");
+            std::fs::write(&path, content).expect("temporary test file is written");
+            path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
 
     fn ok(src: &str) -> SpelIdl {
         generate_idl_from_str(src, "<test>").expect("IDL generation failed")
@@ -1123,7 +1587,7 @@ mod tests {
         let src = r#"
             #[lez_program(instruction = "my_core::Instruction")]
             pub mod my_program {
-                #[instruction]
+                #[instruction(variant_index = 4)]
                 pub fn do_thing(account: AccountWithMetadata) {}
             }
         "#;
@@ -1132,6 +1596,114 @@ mod tests {
             idl.instruction_type.as_deref(),
             Some("my_core::Instruction")
         );
+        assert_eq!(idl.instructions[0].variant_index, Some(4));
+    }
+
+    #[test]
+    fn external_instruction_type_uses_enum_declaration_order_from_path_dependency() {
+        let temp = TempDir::new("external-instruction-order");
+        temp.write(
+            "core/src/lib.rs",
+            r#"
+                #[derive(Serialize, Deserialize)]
+                pub enum Instruction {
+                    Transfer,
+                    PrintNft,
+                    SetAuthority,
+                }
+            "#,
+        );
+        let program = temp.write(
+            "guest/src/bin/token.rs",
+            r#"
+                #[lez_program(instruction = "token_core::Instruction")]
+                pub mod token {
+                    #[instruction]
+                    pub fn transfer() {}
+
+                    #[instruction]
+                    pub fn set_authority() {}
+
+                    #[instruction]
+                    pub fn print_nft() {}
+                }
+            "#,
+        );
+        temp.write(
+            "guest/Cargo.toml",
+            r#"
+                [package]
+                name = "guest"
+                version = "0.1.0"
+
+                [dependencies]
+                token_core = { path = "../core" }
+            "#,
+        );
+
+        let idl = generate_idl_from_file(&program).expect("IDL generation succeeds");
+        let indices = idl
+            .instructions
+            .iter()
+            .map(|instruction| instruction.variant_index)
+            .collect::<Vec<_>>();
+        assert_eq!(indices, vec![Some(0), Some(2), Some(1)]);
+    }
+
+    #[test]
+    fn external_instruction_type_rejects_partial_explicit_mapping() {
+        let source = r#"
+            #[lez_program(instruction = "token_core::Instruction")]
+            pub mod token {
+                #[instruction(variant_index = 0)]
+                pub fn transfer() {}
+
+                #[instruction]
+                pub fn print_nft() {}
+            }
+        "#;
+
+        assert!(matches!(
+            err(source),
+            IdlGenError::ExternalInstructionMapping(message)
+                if message.contains("on every handler or on none of them")
+        ));
+    }
+
+    #[test]
+    fn external_instruction_type_requires_explicit_metadata_for_custom_discriminants() {
+        let parsed = syn::parse_file(
+            r#"
+                #[derive(Serialize, Deserialize)]
+                pub enum Instruction {
+                    Transfer = 7,
+                }
+            "#,
+        )
+        .expect("enum fixture parses");
+        let item_enum = match &parsed.items[0] {
+            syn::Item::Enum(item_enum) => item_enum,
+            _ => panic!("fixture contains an enum"),
+        };
+
+        assert!(!is_plain_serde_enum(item_enum));
+    }
+
+    #[test]
+    fn legacy_instruction_type_rejects_variant_index_metadata() {
+        let source = r#"
+            #[lez_program]
+            pub mod token {
+                #[instruction(variant_index = 0)]
+                pub fn transfer() {}
+            }
+        "#;
+
+        assert!(matches!(
+            err(source),
+            IdlGenError::ExternalInstructionMapping(message)
+                if message.contains("requires #[lez_program")
+        ));
     }
 
     // ── Account constraints ───────────────────────────────────────────────────

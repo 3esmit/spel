@@ -734,6 +734,14 @@ mod tests {
             r#"
 use nssa_core::account::AccountId;
 
+#[derive(Serialize, Deserialize)]
+pub enum Instruction {
+    Transfer,
+    InitializeAccount,
+    Mint,
+    Burn,
+}
+
 #[account_type]
 pub enum TokenDefinition {
     Fungible {

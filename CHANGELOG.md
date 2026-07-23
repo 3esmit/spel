@@ -1,3 +1,28 @@
+## Unreleased
+
+### 🐛 Fixes
+
+- **External IDL instruction discriminants.** The CLI now uses the explicit
+  `variant_index` from complete external-enum IDLs instead of the instruction
+  array position. Runtime and macro IDL generators derive the map from a plain
+  external enum in a direct path dependency, or require explicit metadata when
+  that mapping cannot be proven. The CLI rejects incomplete and duplicate
+  mappings before preparing a transaction, preventing a reordered schema from
+  encoding a different instruction.
+
+### 💥 Breaking Changes (next `0.y` minor release)
+
+- **`IdlInstruction` struct literals.** The public Rust type adds
+  `variant_index: Option<u32>`. Existing serialized IDL JSON remains readable,
+  but Rust callers constructing an `IdlInstruction` must add
+  `variant_index: None` for legacy positional instructions or the wire value
+  for an external enum.
+- **`IdlGenError` exhaustive matches.** The public error enum adds
+  `ExternalInstructionMapping(String)`. Callers that exhaustively match this
+  enum must handle the new variant.
+
+---
+
 ## v0.6.0 (2026-07-15)
 
 ### 💥 Breaking Changes
