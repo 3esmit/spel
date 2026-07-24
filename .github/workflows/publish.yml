@@ -10,6 +10,8 @@ jobs:
     name: Publish Release
     runs-on: ubuntu-latest
     if: github.event.pull_request.merged == true && startsWith(github.head_ref, 'release/v')
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     permissions:
       contents: write
 
@@ -33,13 +35,24 @@ jobs:
           body: |
             ## v${{ steps.version.outputs.version }}
 
-            See [CHANGELOG.md](https://github.com/logos-co/spel/blob/main/CHANGELOG.md) for full details.
+            See [CHANGELOG.md](${{ github.server_url }}/${{ github.repository }}/blob/main/CHANGELOG.md) for full details.
 
             ---
 
             **Installation** (Cargo.toml):
             ```toml
-            spel-framework = { git = "https://github.com/logos-co/spel.git", tag = "v${{ steps.version.outputs.version }}" }
+            spel-framework = { git = "${{ github.server_url }}/${{ github.repository }}.git", tag = "v${{ steps.version.outputs.version }}" }
             ```
           draft: false
           prerelease: false
+
+  release-binaries:
+    name: Publish native CLI bundles
+    needs: publish-release
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release-binaries.yml
+    with:
+      tag: v${{ needs.publish-release.outputs.version }}
+      prerelease: false
+    secrets: inherit

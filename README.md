@@ -8,6 +8,38 @@ Write your program logic with proc macros. Get IDL generation, a full CLI with T
 
 ## Quick Start
 
+### Install prebuilt tools
+
+Each [GitHub release](../../releases) provides one native bundle for Linux
+AMD64 and one for Darwin ARM64. Every bundle contains both `spel` and
+`spel-client-gen`; keep them in the same directory because `spel init` uses the
+companion generator when it creates a project.
+
+```bash
+# Download the matching archive and checksum from the Releases page first.
+VERSION=0.6.0-alpha.1
+TARGET=x86_64-unknown-linux-gnu
+ARCHIVE="spel-${VERSION}-${TARGET}.tar.gz"
+
+# Linux
+sha256sum -c "${ARCHIVE}.sha256"
+
+# macOS
+shasum -a 256 -c "${ARCHIVE}.sha256"
+
+tar -xzf "$ARCHIVE"
+mkdir -p ~/.local/bin
+install -m 0755 "spel-${VERSION}-${TARGET}/spel" ~/.local/bin/spel
+install -m 0755 "spel-${VERSION}-${TARGET}/spel-client-gen" ~/.local/bin/spel-client-gen
+```
+
+Published targets:
+
+- `x86_64-unknown-linux-gnu`
+- `aarch64-apple-darwin`
+
+Rust libraries remain available from the same source tag through `Cargo.toml`.
+
 ### Scaffold a new project
 
 ```bash

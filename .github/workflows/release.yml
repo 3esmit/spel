@@ -141,9 +141,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          PR_URL="https://github.com/logos-co/spel/compare/main...release/v${{ inputs.version }}?expand=1&title=Release+v${{ inputs.version }}&body=Release+v${{ inputs.version }}"
+          PR_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/main...release/v${{ inputs.version }}?expand=1&title=Release+v${{ inputs.version }}&body=Release+v${{ inputs.version }}"
           gh issue create \
-            --repo logos-co/spel \
+            --repo "$GITHUB_REPOSITORY" \
             --title "Release v${{ inputs.version }} ready to merge" \
             --body "Release branch has been prepared. Click to open the PR:\n\n$PR_URL" \
             --label "release" 2>/dev/null || true
