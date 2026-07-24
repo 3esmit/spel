@@ -89,6 +89,7 @@ case "$target" in
       exit 1
     fi
     codesign --verify "$spel"
+    codesign --verify "$python_runtime"
     ;;
   *)
     echo "unsupported release target: $target" >&2

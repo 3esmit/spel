@@ -85,6 +85,11 @@ install -m 0644 "$repo_root/LICENSE-MIT" "$staging_dir/$bundle_name/LICENSE-MIT"
 install -m 0644 "$python_license" "$staging_dir/$bundle_name/LICENSE-PYTHON"
 printf '%s\n' "$version" > "$staging_dir/$bundle_name/VERSION"
 
+if [[ "$target" == aarch64-apple-darwin ]]; then
+  codesign --force --sign - "$staging_dir/$bundle_name/lib/$runtime_name"
+  codesign --force --sign - "$staging_dir/$bundle_name/spel"
+fi
+
 tar -C "$staging_dir" -czf "$output_dir/$archive_name" "$bundle_name"
 
 (
