@@ -17,9 +17,10 @@ companion generator when it creates a project.
 
 ```bash
 # Download the matching archive and checksum from the Releases page first.
-VERSION=0.6.0-alpha.1
+VERSION=0.6.0-alpha.2
 TARGET=x86_64-unknown-linux-gnu
 ARCHIVE="spel-${VERSION}-${TARGET}.tar.gz"
+BUNDLE="spel-${VERSION}-${TARGET}"
 
 # Linux
 sha256sum -c "${ARCHIVE}.sha256"
@@ -28,15 +29,21 @@ sha256sum -c "${ARCHIVE}.sha256"
 shasum -a 256 -c "${ARCHIVE}.sha256"
 
 tar -xzf "$ARCHIVE"
-mkdir -p ~/.local/bin
-install -m 0755 "spel-${VERSION}-${TARGET}/spel" ~/.local/bin/spel
-install -m 0755 "spel-${VERSION}-${TARGET}/spel-client-gen" ~/.local/bin/spel-client-gen
+mkdir -p ~/.local/bin ~/.local/opt
+cp -R "$BUNDLE" ~/.local/opt/
+ln -sfn "$HOME/.local/opt/$BUNDLE/spel" ~/.local/bin/spel
+ln -sfn "$HOME/.local/opt/$BUNDLE/spel-client-gen" ~/.local/bin/spel-client-gen
 ```
 
 Published targets:
 
 - `x86_64-unknown-linux-gnu`
 - `aarch64-apple-darwin`
+
+Keep the extracted bundle together. `spel` resolves its packaged Python runtime
+from the adjacent `lib/` directory; copying only the executable breaks that
+runtime relationship. `LICENSE-PYTHON` contains the corresponding
+redistribution notice.
 
 Rust libraries remain available from the same source tag through `Cargo.toml`.
 

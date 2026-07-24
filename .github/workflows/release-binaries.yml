@@ -7,7 +7,9 @@ on:
       - ".github/workflows/release-binaries.yml"
       - ".github/workflows/weekly-rc.yml"
       - "scripts/package-release-binaries.sh"
+      - "scripts/prepare-release-binary.sh"
       - "scripts/test-release-packaging.sh"
+      - "scripts/verify-release-bundle.sh"
       - "Cargo.lock"
       - "Cargo.toml"
       - "rust-toolchain.toml"
@@ -179,17 +181,74 @@ jobs:
           "target/$TARGET/release/spel" init --help
           "target/$TARGET/release/spel-client-gen" --help
 
-      - name: Package and verify bundle
+      - name: Locate linked Python runtime
+        id: python
         env:
-          PACKAGE_VERSION: ${{ needs.prepare.outputs.package-version }}
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
+          binary="target/$TARGET/release/spel"
+          case "$TARGET" in
+            x86_64-unknown-linux-gnu)
+              runtime="$(
+                ldd "$binary" |
+                  awk '$1 ~ /^libpython/ && $2 == "=>" { print $3 }'
+              )"
+              ;;
+            aarch64-apple-darwin)
+              runtime="$(
+                otool -L "$binary" |
+                  awk 'NR > 1 && ($1 ~ /Python.*framework.*Python/ || $1 ~ /libpython/) {
+                    print $1
+                  }'
+              )"
+              if [[ "$runtime" == @* || ! -r "$runtime" ]]; then
+                runtime="$(
+                  python3 -c '
+          import os
+          import sysconfig
+
+          framework = sysconfig.get_config_var("PYTHONFRAMEWORK")
+          if framework:
+              prefix = sysconfig.get_config_var("PYTHONFRAMEWORKPREFIX")
+              version = sysconfig.get_config_var("PYTHONFRAMEWORKVERSION")
+              print(os.path.join(prefix, f"{framework}.framework", "Versions", version, framework))
+          else:
+              lib_dir = sysconfig.get_config_var("LIBDIR")
+              lib_name = (
+                  sysconfig.get_config_var("INSTSONAME")
+                  or sysconfig.get_config_var("LDLIBRARY")
+              )
+              print(os.path.join(lib_dir, lib_name))
+          '
+                )"
+              fi
+              ;;
+          esac
+          if [[ -z "$runtime" || "$runtime" == *$'\n'* || ! -r "$runtime" ]]; then
+            echo "cannot resolve exactly one linked Python runtime" >&2
+            exit 1
+          fi
+
+          echo "runtime=$runtime" >> "$GITHUB_OUTPUT"
+
+      - name: Package and verify bundle
+        env:
+          PACKAGE_VERSION: ${{ needs.prepare.outputs.package-version }}
+          PYTHON_RUNTIME: ${{ steps.python.outputs.runtime }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          scripts/prepare-release-binary.sh \
+            "$TARGET" \
+            "target/$TARGET/release/spel" \
+            "$PYTHON_RUNTIME"
           scripts/package-release-binaries.sh \
             "$PACKAGE_VERSION" \
             "$TARGET" \
             "target/$TARGET/release" \
-            dist
+            dist \
+            "$PYTHON_RUNTIME"
           scripts/test-release-packaging.sh
           archive="spel-${PACKAGE_VERSION}-${TARGET}.tar.gz"
           (
@@ -200,11 +259,10 @@ jobs:
               shasum -a 256 -c "${archive}.sha256"
             fi
           )
-          extract_dir="$(mktemp -d)"
-          trap 'rm -rf "$extract_dir"' EXIT
-          tar -C "$extract_dir" -xzf "dist/$archive"
-          "$extract_dir/spel-${PACKAGE_VERSION}-${TARGET}/spel" init --help
-          "$extract_dir/spel-${PACKAGE_VERSION}-${TARGET}/spel-client-gen" --help
+          scripts/verify-release-bundle.sh \
+            "$PACKAGE_VERSION" \
+            "$TARGET" \
+            "dist/$archive"
 
       - uses: actions/upload-artifact@v4
         with:
