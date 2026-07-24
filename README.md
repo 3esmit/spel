@@ -17,7 +17,7 @@ companion generator when it creates a project.
 
 ```bash
 # Download the matching archive and checksum from the Releases page first.
-VERSION=0.6.0
+VERSION=0.6.0-alpha.1
 TARGET=x86_64-unknown-linux-gnu
 ARCHIVE="spel-${VERSION}-${TARGET}.tar.gz"
 

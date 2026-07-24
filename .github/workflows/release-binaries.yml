@@ -27,7 +27,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing source tag to package, such as v0.6.0
+        description: Existing source tag to package, such as v0.6.0-alpha.1
         required: true
         type: string
       prerelease:
@@ -91,11 +91,12 @@ jobs:
           test "$spel_version" = "$client_gen_version"
 
           if [[ -n "$INPUT_TAG" ]]; then
-            if [[ ! "$INPUT_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            if [[ ! "$INPUT_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[1-9][0-9]*)?$ ]]; then
               echo "invalid release tag: $INPUT_TAG" >&2
               exit 1
             fi
-            if [[ "$INPUT_TAG" != "v${spel_version}" && ! "$INPUT_TAG" =~ ^v${spel_version}-rc\.[0-9]+$ ]]; then
+            if [[ "$INPUT_TAG" != "v${spel_version}" &&
+                  ! "$INPUT_TAG" =~ ^v${spel_version}-(alpha|beta|rc)\.[1-9][0-9]*$ ]]; then
               echo "tag $INPUT_TAG does not match package version $spel_version" >&2
               exit 1
             fi
