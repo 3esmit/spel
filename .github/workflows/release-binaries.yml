@@ -65,28 +65,29 @@ jobs:
           INPUT_PRERELEASE: ${{ inputs.prerelease }}
         run: |
           set -euo pipefail
-          spel_version="$(
-            awk '
+          read_manifest_version() {
+            awk -F '"' '
               /^\[package\]$/ { in_package = 1; next }
-              in_package && /^version = / {
-                gsub(/^version = "|"$"/, "")
-                print
+              in_package && /^[[:space:]]*version[[:space:]]*=/ {
+                if (NF < 3 || $2 == "") {
+                  exit 1
+                }
+                print $2
                 exit
               }
-            ' spel-cli/Cargo.toml
+            ' "$1"
+          }
+          spel_version="$(
+            read_manifest_version spel-cli/Cargo.toml
           )"
           client_gen_version="$(
-            awk '
-              /^\[package\]$/ { in_package = 1; next }
-              in_package && /^version = / {
-                gsub(/^version = "|"$"/, "")
-                print
-                exit
-              }
-            ' spel-client-gen/Cargo.toml
+            read_manifest_version spel-client-gen/Cargo.toml
           )"
 
-          test -n "$spel_version"
+          if [[ ! "$spel_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "invalid package version: $spel_version" >&2
+            exit 1
+          fi
           test "$spel_version" = "$client_gen_version"
 
           if [[ -n "$INPUT_TAG" ]]; then
