@@ -77,4 +77,3 @@ tar -C "$staging_dir" -czf "$output_dir/$archive_name" "$bundle_name"
     shasum -a 256 "$archive_name" > "${archive_name}.sha256"
   fi
 )
-
