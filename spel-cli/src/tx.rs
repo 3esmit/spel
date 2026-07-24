@@ -15,7 +15,7 @@ use nssa_core::program::ProgramId;
 use sequencer_service_rpc::RpcClient as _;
 use serde_json::{json, Value};
 use spel_framework_core::idl::{IdlInstruction, IdlSeed, IdlType, SpelIdl};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::process;
 use wallet::WalletCore;
@@ -64,6 +64,51 @@ fn is_vec_string(ty: &IdlType) -> bool {
     )
 }
 
+/// Resolve the wire discriminant for an instruction.
+///
+/// Legacy IDLs without an external `instruction_type` use their instruction
+/// position. An external instruction enum can have a different declaration
+/// order, so every IDL instruction must supply a unique `variant_index`.
+fn resolve_instruction_index(idl: &SpelIdl, ix: &IdlInstruction) -> Result<u32, String> {
+    let fallback = idl
+        .instructions
+        .iter()
+        .position(|candidate| candidate.name == ix.name)
+        .ok_or_else(|| format!("instruction `{}` is not declared in the IDL", ix.name))?;
+
+    let Some(instruction_type) = idl.instruction_type.as_deref() else {
+        return u32::try_from(fallback)
+            .map_err(|_| format!("instruction `{}` position exceeds u32", ix.name));
+    };
+
+    let mut seen = HashSet::with_capacity(idl.instructions.len());
+    let mut selected = None;
+
+    for candidate in &idl.instructions {
+        let variant_index = candidate.variant_index.ok_or_else(|| {
+            format!(
+                "external instruction_type `{instruction_type}` requires a u32 `variant_index` for instruction `{}`",
+                candidate.name
+            )
+        })?;
+        if !seen.insert(variant_index) {
+            return Err(format!(
+                "external instruction_type `{instruction_type}` has duplicate variant_index {variant_index}"
+            ));
+        }
+        if candidate.name == ix.name {
+            if selected.replace(variant_index).is_some() {
+                return Err(format!(
+                    "external instruction_type `{instruction_type}` has duplicate instruction name `{}`",
+                    candidate.name
+                ));
+            }
+        }
+    }
+
+    selected.ok_or_else(|| format!("instruction `{}` is not declared in the IDL", ix.name))
+}
+
 pub async fn execute_instruction(
     idl: &SpelIdl,
     ix: &IdlInstruction,
@@ -81,6 +126,14 @@ pub async fn execute_instruction(
     say!("");
 
     let mut args = args.clone();
+
+    // Validate the mapping before parsing or resolving transaction inputs. An
+    // external enum may deliberately expose only a subset of its variants, so
+    // any unique u32 discriminant is valid.
+    let ix_index = resolve_instruction_index(idl, ix).unwrap_or_else(|e| {
+        eprintln!("❌ IDL instruction mapping error: {e}");
+        process::exit(1);
+    });
 
     // Auto-fill program-id args from binary paths
     for (key, bin_path) in extra_bins {
@@ -187,13 +240,8 @@ pub async fn execute_instruction(
     }
 
     // Build risc0 serialized data
-    let ix_index = idl
-        .instructions
-        .iter()
-        .position(|i| i.name == ix.name)
-        .unwrap_or(0);
     let risc0_args: Vec<_> = parsed_args.iter().map(|(_, ty, val)| (*ty, val)).collect();
-    let instruction_data = serialize_to_risc0(ix_index as u32, &risc0_args).unwrap_or_else(|e| {
+    let instruction_data = serialize_to_risc0(ix_index, &risc0_args).unwrap_or_else(|e| {
         eprintln!("❌ Serialization error: {}", e);
         process::exit(1);
     });
@@ -591,6 +639,99 @@ pub async fn execute_instruction(
                 process::exit(1);
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_instruction_index;
+    use spel_framework_core::idl::{IdlInstruction, SpelIdl};
+
+    fn instruction(name: &str, variant_index: Option<u32>) -> IdlInstruction {
+        IdlInstruction {
+            name: name.to_string(),
+            accounts: vec![],
+            args: vec![],
+            variant_index,
+            discriminator: None,
+            execution: None,
+            variant: None,
+        }
+    }
+
+    fn external_token_idl() -> SpelIdl {
+        let mut idl = SpelIdl::new("token");
+        idl.instruction_type = Some("token_core::Instruction".to_string());
+        idl.instructions = vec![
+            instruction("transfer", Some(0)),
+            instruction("new_fungible_definition", Some(1)),
+            instruction("new_definition_with_metadata", Some(2)),
+            instruction("initialize_account", Some(3)),
+            instruction("burn", Some(4)),
+            instruction("mint", Some(5)),
+            instruction("mint_with_authority", Some(6)),
+            instruction("set_authority", Some(8)),
+            instruction("set_authority_with_authority", Some(9)),
+            instruction("print_nft", Some(7)),
+        ];
+        idl
+    }
+
+    #[test]
+    fn external_instruction_uses_declared_non_positional_variant_index() {
+        let idl = external_token_idl();
+
+        assert_eq!(resolve_instruction_index(&idl, &idl.instructions[7]), Ok(8));
+        assert_eq!(resolve_instruction_index(&idl, &idl.instructions[9]), Ok(7));
+    }
+
+    #[test]
+    fn external_instruction_requires_a_complete_variant_map() {
+        let mut idl = external_token_idl();
+        idl.instructions[7].variant_index = None;
+
+        let error = resolve_instruction_index(&idl, &idl.instructions[0]).unwrap_err();
+        assert!(error.contains("requires a u32 `variant_index` for instruction `set_authority`"));
+    }
+
+    #[test]
+    fn external_instruction_allows_a_non_contiguous_variant_index() {
+        let mut idl = external_token_idl();
+        idl.instructions[7].variant_index = Some(42);
+
+        assert_eq!(
+            resolve_instruction_index(&idl, &idl.instructions[7]),
+            Ok(42)
+        );
+    }
+
+    #[test]
+    fn external_instruction_rejects_duplicate_variant_indices() {
+        let mut idl = external_token_idl();
+        idl.instructions[7].variant_index = Some(7);
+
+        let error = resolve_instruction_index(&idl, &idl.instructions[0]).unwrap_err();
+        assert!(error.contains("has duplicate variant_index 7"));
+    }
+
+    #[test]
+    fn external_instruction_rejects_duplicate_names() {
+        let mut idl = external_token_idl();
+        idl.instructions[7].name = "transfer".to_string();
+
+        let error = resolve_instruction_index(&idl, &idl.instructions[0]).unwrap_err();
+        assert!(error.contains("has duplicate instruction name `transfer`"));
+    }
+
+    #[test]
+    fn legacy_instruction_uses_its_position() {
+        let mut idl = SpelIdl::new("legacy");
+        idl.instructions = vec![
+            instruction("first", Some(4)),
+            instruction("second", Some(9)),
+        ];
+
+        assert_eq!(resolve_instruction_index(&idl, &idl.instructions[1]), Ok(1));
     }
 }
 

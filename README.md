@@ -209,6 +209,23 @@ The generated IDL is a superset of the lssa-lang IDL spec. In addition to our co
 - **execution** -- public/private_owned flags (default: public execution)
 - **variant** -- PascalCase variant name
 
+For an IDL that declares an external `instruction_type`, every instruction
+must include its serialized enum `variant_index`. The runtime generator and
+both macro producers infer it only when the enum is a direct local
+path-dependency with a plain `#[derive(Serialize, Deserialize)]` definition.
+For registry, git, re-exported, custom-codec, or otherwise unresolvable enums,
+declare `#[instruction(variant_index = N)]` on every handler. External enum
+declaration order cannot be inferred from handler order; the CLI rejects
+missing or duplicate indices before it prepares a transaction. Legacy IDLs
+without `instruction_type` continue to use instruction order.
+
+IDL JSON written before this field existed remains readable. Rust callers that
+construct `IdlInstruction` directly must add `variant_index: None` for legacy
+instructions, or the declared wire discriminant for external enums. This is a
+source-compatibility change planned for the next `0.y` minor release. The
+public `IdlGenError` enum also adds `ExternalInstructionMapping(String)`, so
+exhaustive Rust matches must handle that variant.
+
 Each account field includes:
 
 - **visibility** -- list of visibility tags (default: public)
