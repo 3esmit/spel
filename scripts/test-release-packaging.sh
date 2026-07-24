@@ -20,8 +20,13 @@ case "$(uname -s)/$(uname -m)" in
 esac
 
 mkdir -p "$temp_dir/bin" "$temp_dir/dist" "$temp_dir/extract"
-install -m 0755 /bin/true "$temp_dir/bin/spel"
-install -m 0755 /bin/true "$temp_dir/bin/spel-client-gen"
+true_binary="$(type -P true)"
+if [[ ! -x "$true_binary" ]]; then
+  echo "cannot locate an executable true command" >&2
+  exit 1
+fi
+install -m 0755 "$true_binary" "$temp_dir/bin/spel"
+install -m 0755 "$true_binary" "$temp_dir/bin/spel-client-gen"
 
 "$repo_root/scripts/package-release-binaries.sh" \
   "0.0.0-test.1" \
