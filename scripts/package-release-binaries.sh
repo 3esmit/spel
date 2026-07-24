@@ -2,8 +2,8 @@
 
 set -euo pipefail
 
-if [[ $# -ne 4 ]]; then
-  echo "usage: $0 <version> <target> <binary-dir> <output-dir>" >&2
+if [[ $# -ne 6 ]]; then
+  echo "usage: $0 <version> <target> <binary-dir> <output-dir> <python-runtime> <python-license>" >&2
   exit 2
 fi
 
@@ -11,6 +11,8 @@ version="$1"
 target="$2"
 binary_dir="$3"
 output_dir="$4"
+python_runtime="$5"
+python_license="$6"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [[ ! "$version" =~ ^[0-9A-Za-z][0-9A-Za-z.+-]*$ ]]; then
@@ -54,17 +56,33 @@ for binary in spel spel-client-gen; do
   fi
 done
 
+if [[ ! -r "$python_runtime" ]]; then
+  echo "missing Python runtime: $python_runtime" >&2
+  exit 1
+fi
+if [[ ! -r "$python_license" ]]; then
+  echo "missing Python license: $python_license" >&2
+  exit 1
+fi
+runtime_name="$(basename "$python_runtime")"
+if [[ ! "$runtime_name" =~ ^[0-9A-Za-z._+-]+$ ]]; then
+  echo "invalid Python runtime name: $runtime_name" >&2
+  exit 1
+fi
+
 bundle_name="spel-${version}-${target}"
 archive_name="${bundle_name}.tar.gz"
 staging_dir="$(mktemp -d)"
 trap 'rm -rf "$staging_dir"' EXIT
 
-mkdir -p "$staging_dir/$bundle_name" "$output_dir"
+mkdir -p "$staging_dir/$bundle_name/lib" "$output_dir"
 install -m 0755 "$binary_dir/spel" "$staging_dir/$bundle_name/spel"
 install -m 0755 "$binary_dir/spel-client-gen" "$staging_dir/$bundle_name/spel-client-gen"
+install -m 0755 "$python_runtime" "$staging_dir/$bundle_name/lib/$runtime_name"
 install -m 0644 "$repo_root/README.md" "$staging_dir/$bundle_name/README.md"
 install -m 0644 "$repo_root/LICENSE-APACHE-v2" "$staging_dir/$bundle_name/LICENSE-APACHE-v2"
 install -m 0644 "$repo_root/LICENSE-MIT" "$staging_dir/$bundle_name/LICENSE-MIT"
+install -m 0644 "$python_license" "$staging_dir/$bundle_name/LICENSE-PYTHON"
 printf '%s\n' "$version" > "$staging_dir/$bundle_name/VERSION"
 
 tar -C "$staging_dir" -czf "$output_dir/$archive_name" "$bundle_name"

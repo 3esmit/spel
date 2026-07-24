@@ -10,6 +10,11 @@
 
 ### 🐛 Fixes
 
+- **Portable prebuilt CLI.** Native bundles now carry the exact Python runtime
+  linked through the wallet/keycard dependency and resolve it relative to the
+  packaged `spel` executable. Downloaded Linux and macOS tools no longer depend
+  on the build runner's version-specific Python installation path.
+
 - **External IDL instruction discriminants.** The CLI now uses the explicit
   `variant_index` from complete external-enum IDLs instead of the instruction
   array position. Runtime and macro IDL generators derive the map from a plain

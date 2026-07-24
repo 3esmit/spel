@@ -32,7 +32,9 @@ install -m 0755 "$true_binary" "$temp_dir/bin/spel-client-gen"
   "0.0.0-test.1" \
   "$target" \
   "$temp_dir/bin" \
-  "$temp_dir/dist"
+  "$temp_dir/dist" \
+  "$true_binary" \
+  "$repo_root/LICENSE-MIT"
 
 archive="spel-0.0.0-test.1-${target}.tar.gz"
 checksum="${archive}.sha256"
@@ -58,6 +60,8 @@ test "$(cat "$bundle/VERSION")" = "0.0.0-test.1"
 test -s "$bundle/README.md"
 test -s "$bundle/LICENSE-APACHE-v2"
 test -s "$bundle/LICENSE-MIT"
+test -s "$bundle/LICENSE-PYTHON"
+test -x "$bundle/lib/$(basename "$true_binary")"
 
 actual_files="$(
   for path in "$bundle"/*; do
@@ -69,6 +73,7 @@ actual_files="$(
 expected_files="$(printf '%s\n' \
   LICENSE-APACHE-v2 \
   LICENSE-MIT \
+  LICENSE-PYTHON \
   README.md \
   VERSION \
   spel \
