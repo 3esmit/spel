@@ -1,0 +1,254 @@
+name: Release Binaries
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/publish.yml"
+      - ".github/workflows/release-binaries.yml"
+      - ".github/workflows/weekly-rc.yml"
+      - "scripts/package-release-binaries.sh"
+      - "scripts/test-release-packaging.sh"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+      - "spel-cli/**"
+      - "spel-client-gen/**"
+      - "spel-framework-core/**"
+  workflow_call:
+    inputs:
+      tag:
+        description: Existing source tag to package
+        required: true
+        type: string
+      prerelease:
+        description: Create a prerelease if release metadata does not exist
+        required: true
+        type: boolean
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing source tag to package, such as v0.6.0
+        required: true
+        type: string
+      prerelease:
+        description: Create a prerelease if release metadata does not exist
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: Validate source ref
+    runs-on: ubuntu-24.04
+    outputs:
+      checkout-ref: ${{ steps.release.outputs.checkout_ref }}
+      package-version: ${{ steps.release.outputs.package_version }}
+      publish: ${{ steps.release.outputs.publish }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag || github.event.pull_request.head.sha || github.sha }}
+
+      - name: Validate release identity
+        id: release
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          spel_version="$(
+            awk '
+              /^\[package\]$/ { in_package = 1; next }
+              in_package && /^version = / {
+                gsub(/^version = "|"$"/, "")
+                print
+                exit
+              }
+            ' spel-cli/Cargo.toml
+          )"
+          client_gen_version="$(
+            awk '
+              /^\[package\]$/ { in_package = 1; next }
+              in_package && /^version = / {
+                gsub(/^version = "|"$"/, "")
+                print
+                exit
+              }
+            ' spel-client-gen/Cargo.toml
+          )"
+
+          test -n "$spel_version"
+          test "$spel_version" = "$client_gen_version"
+
+          if [[ -n "$INPUT_TAG" ]]; then
+            if [[ ! "$INPUT_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+              echo "invalid release tag: $INPUT_TAG" >&2
+              exit 1
+            fi
+            if [[ "$INPUT_TAG" != "v${spel_version}" && ! "$INPUT_TAG" =~ ^v${spel_version}-rc\.[0-9]+$ ]]; then
+              echo "tag $INPUT_TAG does not match package version $spel_version" >&2
+              exit 1
+            fi
+            git describe --tags --exact-match --match "$INPUT_TAG" HEAD
+            package_version="${INPUT_TAG#v}"
+            publish=true
+            tag="$INPUT_TAG"
+            prerelease="$INPUT_PRERELEASE"
+          else
+            package_version="${spel_version}-pr.${{ github.event.pull_request.number }}"
+            publish=false
+            tag=""
+            prerelease=true
+          fi
+
+          {
+            echo "checkout_ref=$(git rev-parse HEAD)"
+            echo "package_version=$package_version"
+            echo "publish=$publish"
+            echo "prerelease=$prerelease"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.checkout-ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: release-${{ matrix.target }}
+
+      - name: Verify native runner
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          case "$TARGET" in
+            x86_64-unknown-linux-gnu)
+              test "$(uname -s)" = Linux
+              test "$(uname -m)" = x86_64
+              ;;
+            aarch64-apple-darwin)
+              test "$(uname -s)" = Darwin
+              test "$(uname -m)" = arm64
+              ;;
+          esac
+
+      - name: Install logos-blockchain circuits
+        run: |
+          curl -sSL https://raw.githubusercontent.com/logos-blockchain/logos-blockchain/1da154c74b911318fb853d37261f8a05ffe513b4/scripts/setup-logos-blockchain-circuits.sh | bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build release executables
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --locked --release --target "$TARGET" -p spel -p spel-client-gen
+
+      - name: Smoke-test native executables
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          "target/$TARGET/release/spel" init --help
+          "target/$TARGET/release/spel-client-gen" --help
+
+      - name: Package and verify bundle
+        env:
+          PACKAGE_VERSION: ${{ needs.prepare.outputs.package-version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          scripts/package-release-binaries.sh \
+            "$PACKAGE_VERSION" \
+            "$TARGET" \
+            "target/$TARGET/release" \
+            dist
+          scripts/test-release-packaging.sh
+          archive="spel-${PACKAGE_VERSION}-${TARGET}.tar.gz"
+          (
+            cd dist
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum -c "${archive}.sha256"
+            else
+              shasum -a 256 -c "${archive}.sha256"
+            fi
+          )
+          extract_dir="$(mktemp -d)"
+          trap 'rm -rf "$extract_dir"' EXIT
+          tar -C "$extract_dir" -xzf "dist/$archive"
+          "$extract_dir/spel-${PACKAGE_VERSION}-${TARGET}/spel" init --help
+          "$extract_dir/spel-${PACKAGE_VERSION}-${TARGET}/spel-client-gen" --help
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spel-${{ needs.prepare.outputs.package-version }}-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Attach source-owned release files
+    if: needs.prepare.outputs.publish == 'true'
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: spel-${{ needs.prepare.outputs.package-version }}-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify downloaded assets
+        run: |
+          set -euo pipefail
+          test "$(find dist -maxdepth 1 -name '*.tar.gz' -type f | wc -l)" -eq 2
+          test "$(find dist -maxdepth 1 -name '*.sha256' -type f | wc -l)" -eq 2
+          (
+            cd dist
+            for checksum in *.sha256; do
+              sha256sum -c "$checksum"
+            done
+          )
+
+      - name: Create or update GitHub release
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            release_args=(release create "$TAG" --verify-tag --title "$TAG" --generate-notes)
+            if [[ "$PRERELEASE" == true ]]; then
+              release_args+=(--prerelease)
+            fi
+            gh "${release_args[@]}"
+          fi
+          gh release upload "$TAG" dist/* --clobber

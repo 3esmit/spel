@@ -1,5 +1,13 @@
 ## Unreleased
 
+### 📦 Release
+
+- GitHub releases now publish source-owned, checksum-protected CLI bundles for
+  Linux AMD64 and Darwin ARM64. Each bundle keeps `spel` and
+  `spel-client-gen` together so project scaffolding works without compiling the
+  toolchain locally. Stable releases, weekly release candidates, and manual
+  repair dispatches use the same native build workflow.
+
 ### 🐛 Fixes
 
 - **External IDL instruction discriminants.** The CLI now uses the explicit

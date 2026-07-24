@@ -12,6 +12,8 @@ jobs:
   weekly-rc:
     name: Publish Weekly RC
     runs-on: ubuntu-latest
+    outputs:
+      rc-version: ${{ steps.version.outputs.rc_version }}
     permissions:
       contents: write
 
@@ -165,5 +167,17 @@ jobs:
 
             **Installation** (Cargo.toml):
             ```toml
-            spel-framework = { git = "https://github.com/logos-co/spel.git", tag = "v${{ steps.version.outputs.rc_version }}" }
+            spel-framework = { git = "${{ github.server_url }}/${{ github.repository }}.git", tag = "v${{ steps.version.outputs.rc_version }}" }
             ```
+
+  release-binaries:
+    name: Publish native CLI bundles
+    if: needs.weekly-rc.outputs.rc-version != ''
+    needs: weekly-rc
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release-binaries.yml
+    with:
+      tag: v${{ needs.weekly-rc.outputs.rc-version }}
+      prerelease: true
+    secrets: inherit
