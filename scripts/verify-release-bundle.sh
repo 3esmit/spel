@@ -96,6 +96,5 @@ case "$target" in
     ;;
 esac
 
-"$spel" --help
 "$spel" init --help
 "$client_gen" --help

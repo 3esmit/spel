@@ -230,38 +230,11 @@ jobs:
             exit 1
           fi
 
-          python_prefix="$(python3 -c 'import sys; print(sys.base_prefix)')"
-          python_version="$(
-            python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")'
-          )"
-          shopt -s nullglob
-          license_candidates=(
-            "$python_prefix/LICENSE"
-            "$python_prefix/LICENSE.txt"
-            /usr/share/doc/libpython"${python_version}"*/copyright
-            /usr/share/doc/python"${python_version}"*/copyright
-          )
-          python_license=""
-          for candidate in "${license_candidates[@]}"; do
-            if [[ -r "$candidate" ]]; then
-              python_license="$candidate"
-              break
-            fi
-          done
-          if [[ -z "$python_license" ]]; then
-            echo "cannot locate Python redistribution license" >&2
-            exit 1
-          fi
-
-          {
-            echo "runtime=$runtime"
-            echo "license=$python_license"
-          } >> "$GITHUB_OUTPUT"
+          echo "runtime=$runtime" >> "$GITHUB_OUTPUT"
 
       - name: Package and verify bundle
         env:
           PACKAGE_VERSION: ${{ needs.prepare.outputs.package-version }}
-          PYTHON_LICENSE: ${{ steps.python.outputs.license }}
           PYTHON_RUNTIME: ${{ steps.python.outputs.runtime }}
           TARGET: ${{ matrix.target }}
         run: |
@@ -275,8 +248,7 @@ jobs:
             "$TARGET" \
             "target/$TARGET/release" \
             dist \
-            "$PYTHON_RUNTIME" \
-            "$PYTHON_LICENSE"
+            "$PYTHON_RUNTIME"
           scripts/test-release-packaging.sh
           archive="spel-${PACKAGE_VERSION}-${TARGET}.tar.gz"
           (

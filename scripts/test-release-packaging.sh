@@ -33,8 +33,7 @@ install -m 0755 "$true_binary" "$temp_dir/bin/spel-client-gen"
   "$target" \
   "$temp_dir/bin" \
   "$temp_dir/dist" \
-  "$true_binary" \
-  "$repo_root/LICENSE-MIT"
+  "$true_binary"
 
 archive="spel-0.0.0-test.1-${target}.tar.gz"
 checksum="${archive}.sha256"

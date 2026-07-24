@@ -2,8 +2,8 @@
 
 set -euo pipefail
 
-if [[ $# -ne 6 ]]; then
-  echo "usage: $0 <version> <target> <binary-dir> <output-dir> <python-runtime> <python-license>" >&2
+if [[ $# -ne 5 ]]; then
+  echo "usage: $0 <version> <target> <binary-dir> <output-dir> <python-runtime>" >&2
   exit 2
 fi
 
@@ -12,8 +12,8 @@ target="$2"
 binary_dir="$3"
 output_dir="$4"
 python_runtime="$5"
-python_license="$6"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+python_license="$repo_root/LICENSE-PYTHON"
 
 if [[ ! "$version" =~ ^[0-9A-Za-z][0-9A-Za-z.+-]*$ ]]; then
   echo "invalid release version: $version" >&2
